@@ -1,0 +1,12 @@
+node_modules/
+dist/
+src-tauri/target/
+database/
+inputs/
+results/
+logs/
+*.pyc
+__pycache__/
+.env
+.env.*
+!.env.example
