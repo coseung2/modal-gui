@@ -4,8 +4,17 @@
 //! migrations and in the join/aggregate queries. These tests run against
 //! in-memory databases and never touch the user's application database.
 
-use crate::*;
+use crate::accounts::{
+    archive_profile, is_valid_modal_profile_name, list_profiles, resolve_profile, save_profile,
+    set_profile_enabled, ProfileInput,
+};
+use crate::database::{current_period, init_db, latest_billing_period, read_active_modal_profile};
+use crate::diagnostics::{sanitize_detail, DETAIL_LIMIT};
+use crate::jobs::{apply_worker_event, mark_spawn_failure_row, mark_worker_exit_row};
+use crate::usage::{usage_rows, value_as_f64, write_sync_summary};
+use rusqlite::params;
 use rusqlite::Connection;
+use serde_json::json;
 use serde_json::Value;
 
 /// The schema as shipped before accounts and usage gained their newer columns.
@@ -79,7 +88,9 @@ fn migrations_upgrade_the_previous_schema_without_losing_rows() {
     assert_eq!(profiles[0].modal_profile_name, None);
     assert_eq!(profiles[0].month_cost, 0.0);
     let kind: Option<String> = conn
-        .query_row("SELECT kind FROM jobs WHERE id = 'job_1'", [], |row| row.get(0))
+        .query_row("SELECT kind FROM jobs WHERE id = 'job_1'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(kind, None);
 
@@ -88,14 +99,22 @@ fn migrations_upgrade_the_previous_schema_without_losing_rows() {
     init_db(&conn).unwrap();
     assert_eq!(list_profiles(&conn).unwrap().len(), 1);
     let indexes: Vec<String> = conn
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_records'")
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'usage_records'",
+        )
         .unwrap()
         .query_map([], |row| row.get(0))
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert!(indexes.contains(&String::from("usage_records_profile_period")), "{indexes:?}");
-    assert!(indexes.contains(&String::from("usage_records_job_id")), "{indexes:?}");
+    assert!(
+        indexes.contains(&String::from("usage_records_profile_period")),
+        "{indexes:?}"
+    );
+    assert!(
+        indexes.contains(&String::from("usage_records_job_id")),
+        "{indexes:?}"
+    );
 }
 
 #[test]
@@ -125,7 +144,9 @@ fn saving_an_account_keeps_its_id_and_enabled_state() {
     let created = save_profile(&conn, &draft(None, "두 번째")).unwrap();
     assert_eq!(created.len(), 2);
     assert_eq!(created.iter().filter(|item| item.enabled).count(), 1);
-    assert!(created.iter().any(|item| item.name == "두 번째" && item.id != "modal_01"));
+    assert!(created
+        .iter()
+        .any(|item| item.name == "두 번째" && item.id != "modal_01"));
 }
 
 #[test]
@@ -192,7 +213,11 @@ fn usage_rows_pair_jobs_with_recorded_cost_only() {
     assert!(job_b["recorded_cost"].is_null());
     assert_eq!(job_b["kind"].as_str(), Some("music"));
     // App-level billing rows stay out of the per-job table.
-    assert!(value.get("objects").and_then(Value::as_array).unwrap().is_empty());
+    assert!(value
+        .get("objects")
+        .and_then(Value::as_array)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -238,7 +263,10 @@ fn archiving_an_account_keeps_its_jobs_and_cost_history() {
 
     // History still resolves the account name from the tombstone.
     let rows = usage_rows(&conn, 50).unwrap();
-    assert_eq!(rows["jobs"][0]["profile_name"].as_str(), Some("기본 Modal 계정"));
+    assert_eq!(
+        rows["jobs"][0]["profile_name"].as_str(),
+        Some("기본 Modal 계정")
+    );
     assert!(archive_profile(&conn, "modal_01").is_err());
     assert!(archive_profile(&conn, "ghost").is_err());
 }
@@ -273,7 +301,10 @@ fn account_validation_rejects_bad_input_without_storing_secrets() {
         budget_limit: Some(-3.0),
         ..draft(Some("modal_01"), "계정")
     };
-    assert_eq!(save_profile(&conn, &negative).unwrap()[0].budget_limit, None);
+    assert_eq!(
+        save_profile(&conn, &negative).unwrap()[0].budget_limit,
+        None
+    );
 }
 
 #[test]
@@ -303,7 +334,9 @@ fn an_explicit_account_is_never_switched_or_stopped_silently() {
     save_profile(&conn, &preferred).unwrap();
     assert_ne!(resolve_profile(&conn, &None).unwrap().0, "modal_01");
     assert_eq!(
-        resolve_profile(&conn, &Some(String::from("modal_01"))).unwrap().0,
+        resolve_profile(&conn, &Some(String::from("modal_01")))
+            .unwrap()
+            .0,
         "modal_01"
     );
 
@@ -348,7 +381,11 @@ fn worker_events_update_job_state_and_leave_an_audit_row() {
         [],
     )
     .unwrap();
-    apply_worker_event(&conn, &json!({"type": "stage", "job_id": "job_1", "stage": "GENERATING"})).unwrap();
+    apply_worker_event(
+        &conn,
+        &json!({"type": "stage", "job_id": "job_1", "stage": "GENERATING"}),
+    )
+    .unwrap();
     let (status, stage, started): (String, String, Option<String>) = conn
         .query_row(
             "SELECT status, stage, started_at FROM jobs WHERE id = 'job_1'",
@@ -366,7 +403,9 @@ fn worker_events_update_job_state_and_leave_an_audit_row() {
     )
     .unwrap();
     let status: String = conn
-        .query_row("SELECT status FROM jobs WHERE id = 'job_1'", [], |row| row.get(0))
+        .query_row("SELECT status FROM jobs WHERE id = 'job_1'", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(status, "DOWNLOADING");
 
@@ -425,7 +464,11 @@ fn worker_events_update_job_state_and_leave_an_audit_row() {
     assert!(!message.contains('\n'), "{message}");
 
     // Events for a job we do not know about are ignored, not errors.
-    apply_worker_event(&conn, &json!({"type": "stage", "job_id": "ghost", "stage": "GENERATING"})).unwrap();
+    apply_worker_event(
+        &conn,
+        &json!({"type": "stage", "job_id": "ghost", "stage": "GENERATING"}),
+    )
+    .unwrap();
     assert!(apply_worker_event(&conn, &json!({"type": "stage"})).is_ok());
     let events: i64 = conn
         .query_row("SELECT COUNT(*) FROM job_events", [], |row| row.get(0))
@@ -450,7 +493,8 @@ fn repeated_syncs_stay_duplicate_free_and_keep_older_months() {
         "rows": [{"object_id": "ap-1", "description": "minimax-h3-latest-workflows", "period": "2026-10", "cost": "1.25"}],
         "intervals": 1
     });
-    let (intervals, objects, periods) = write_sync_summary(&conn, "modal_01", &october, "now").unwrap();
+    let (intervals, objects, periods) =
+        write_sync_summary(&conn, "modal_01", &october, "now").unwrap();
     assert_eq!((intervals, objects), (1, 1));
     assert_eq!(periods, vec![String::from("2026-10")]);
     write_sync_summary(&conn, "modal_01", &october, "later").unwrap();
@@ -471,7 +515,8 @@ fn repeated_syncs_stay_duplicate_free_and_keep_older_months() {
 
     // A report with no intervals changes nothing at all.
     let empty = json!({"period": "2026-11", "periods": [], "total": "0", "rows": [], "apps": []});
-    let (intervals, objects, periods) = write_sync_summary(&conn, "modal_01", &empty, "now").unwrap();
+    let (intervals, objects, periods) =
+        write_sync_summary(&conn, "modal_01", &empty, "now").unwrap();
     assert_eq!((intervals, objects), (0, 0));
     assert!(periods.is_empty());
     let total: i64 = conn
@@ -494,7 +539,10 @@ fn sensitive_detail_is_redacted_and_clipped() {
     let long = sanitize_detail(&"x".repeat(900), DETAIL_LIMIT);
     assert_eq!(long.chars().count(), DETAIL_LIMIT + 1);
     assert!(long.ends_with('…'));
-    assert_eq!(sanitize_detail("  tidy   text  ", DETAIL_LIMIT), "tidy text");
+    assert_eq!(
+        sanitize_detail("  tidy   text  ", DETAIL_LIMIT),
+        "tidy text"
+    );
 }
 
 #[test]
@@ -511,25 +559,61 @@ fn quoted_and_nested_secrets_never_survive() {
     // A quoted value used to stop at the quote and leave the secret in place.
     for (input, secret) in [
         (r#"token="sess-abcdef123456" done"#, "sess-abcdef123456"),
-        (r#"MODAL_TOKEN_SECRET="plainvalue123" done"#, "plainvalue123"),
-        (r#"MODAL_TOKEN_SECRET = 'single-quoted-secret' end"#, "single-quoted-secret"),
-        (r#"MODAL_TOKEN_SECRET = "spaced-secret-321" end"#, "spaced-secret-321"),
-        (r#"token = `backtick-secret-222` end"#, "backtick-secret-222"),
-        (r#"Authorization: Bearer "quoted-bearer-secret" end"#, "quoted-bearer-secret"),
-        (r#"Authorization: Bearer bare-bearer-secret end"#, "bare-bearer-secret"),
-        (r#"{"token":"json-secret-987","other":1}"#, "json-secret-987"),
-        (r#"{"api":{"MODAL_TOKEN_SECRET":"nested-secret-654"}}"#, "nested-secret-654"),
+        (
+            r#"MODAL_TOKEN_SECRET="plainvalue123" done"#,
+            "plainvalue123",
+        ),
+        (
+            r#"MODAL_TOKEN_SECRET = 'single-quoted-secret' end"#,
+            "single-quoted-secret",
+        ),
+        (
+            r#"MODAL_TOKEN_SECRET = "spaced-secret-321" end"#,
+            "spaced-secret-321",
+        ),
+        (
+            r#"token = `backtick-secret-222` end"#,
+            "backtick-secret-222",
+        ),
+        (
+            r#"Authorization: Bearer "quoted-bearer-secret" end"#,
+            "quoted-bearer-secret",
+        ),
+        (
+            r#"Authorization: Bearer bare-bearer-secret end"#,
+            "bare-bearer-secret",
+        ),
+        (
+            r#"{"token":"json-secret-987","other":1}"#,
+            "json-secret-987",
+        ),
+        (
+            r#"{"api":{"MODAL_TOKEN_SECRET":"nested-secret-654"}}"#,
+            "nested-secret-654",
+        ),
         (r#"token: colon-secret-777 end"#, "colon-secret-777"),
         (r#"token="esc\"aped-secret-111" end"#, "aped-secret-111"),
-        (r#"token="unterminated-secret-999"#, "unterminated-secret-999"),
-        (r#"MODAL_TOKEN_SECRET=as-9876543210abcdef"#, "9876543210abcdef"),
+        (
+            r#"token="unterminated-secret-999"#,
+            "unterminated-secret-999",
+        ),
+        (
+            r#"MODAL_TOKEN_SECRET=as-9876543210abcdef"#,
+            "9876543210abcdef",
+        ),
         (r#"key=ghp_abcdef0123456789"#, "abcdef0123456789"),
         (r#"token=ak-0123456789abcdef"#, "0123456789abcdef"),
         (r#"sk-abcdef0123456789"#, "abcdef0123456789"),
     ] {
         let cleaned = sanitize_detail(input, DETAIL_LIMIT);
-        assert!(!cleaned.contains(secret), "leaked {secret} from {input} -> {cleaned}");
-        assert!(cleaned.contains("<redacted>"), "nothing redacted: {input} -> {cleaned}");
+        assert!(
+            !cleaned.contains(secret),
+            "leaked {secret} from {input} -> {cleaned}"
+        );
+        assert!(
+            cleaned.contains("<redacted>"),
+            "nothing redacted: {input} -> {cleaned}"
+        );
     }
 }
 
@@ -544,9 +628,18 @@ fn redaction_markers_are_not_duplicated_or_added_without_a_value() {
 
     // A marker with nothing after it stays untouched and prose is preserved.
     assert_eq!(sanitize_detail("token=", DETAIL_LIMIT), "token=");
-    assert_eq!(sanitize_detail("MODAL_TOKEN_SECRET= ", DETAIL_LIMIT), "MODAL_TOKEN_SECRET=");
-    assert_eq!(sanitize_detail("MODAL_TOKEN_SECRET:   ", DETAIL_LIMIT), "MODAL_TOKEN_SECRET:");
-    assert_eq!(sanitize_detail("no token expired here", DETAIL_LIMIT), "no token expired here");
+    assert_eq!(
+        sanitize_detail("MODAL_TOKEN_SECRET= ", DETAIL_LIMIT),
+        "MODAL_TOKEN_SECRET="
+    );
+    assert_eq!(
+        sanitize_detail("MODAL_TOKEN_SECRET:   ", DETAIL_LIMIT),
+        "MODAL_TOKEN_SECRET:"
+    );
+    assert_eq!(
+        sanitize_detail("no token expired here", DETAIL_LIMIT),
+        "no token expired here"
+    );
 
     let clipped = sanitize_detail(&format!(r#"token="{}""#, "s".repeat(900)), DETAIL_LIMIT);
     assert!(!clipped.contains("ssss"), "{clipped}");
@@ -605,7 +698,9 @@ fn the_active_modal_profile_returns_only_a_section_name() {
     .unwrap();
     // Only the section name comes back; token lines never leave the file read.
     assert_eq!(read_active_modal_profile(&path).as_deref(), Some("second"));
-    assert!(!read_active_modal_profile(&path).unwrap_or_default().contains("token"));
+    assert!(!read_active_modal_profile(&path)
+        .unwrap_or_default()
+        .contains("token"));
     std::fs::write(&path, "[only]\ntoken = \"a\"\n").unwrap();
     assert_eq!(read_active_modal_profile(&path), None);
     assert_eq!(read_active_modal_profile(&dir.join("missing.toml")), None);
