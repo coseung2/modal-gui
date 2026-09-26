@@ -1,7 +1,12 @@
 import json
 from typing import Any
 
-REQUIRED = {"start_job": ("job_id", "profile_id", "input_path", "prompt"), "attach_job": ("job_id", "profile_id", "function_call_id"), "cancel_job": ("job_id",)}
+REQUIRED = {
+    "start_job": ("job_id", "profile_id", "prompt"),
+    "start_music": ("job_id", "profile_id", "style", "lyrics"),
+    "attach_job": ("job_id", "profile_id", "function_call_id"),
+    "cancel_job": ("job_id",),
+}
 
 def decode(line: str) -> dict[str, Any]:
     message = json.loads(line)

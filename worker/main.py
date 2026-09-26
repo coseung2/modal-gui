@@ -11,8 +11,8 @@ def main():
     while True:
         line = sys.stdin.readline()
         if not line:
-            time.sleep(1)
-            continue
+            runner.wait_for_jobs()
+            break
         if not line.strip(): continue
         try:
             message = decode(line)
